@@ -1,0 +1,323 @@
+name: Cloud-Native Delivery CI
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  APPLICATION_REPOSITORY: psardinha/full-stack-observability
+  APPLICATION_BRANCH: main
+
+jobs:
+  build-and-test:
+    name: Build and test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout delivery platform
+        uses: actions/checkout@v5
+
+      - name: Checkout application
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ env.APPLICATION_REPOSITORY }}
+          ref: ${{ env.APPLICATION_BRANCH }}
+          path: application
+
+      - name: Secret scanning
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Java 25
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '25'
+          cache: maven
+          cache-dependency-path: application/backend/pom.xml
+
+      - name: Display Java version
+        working-directory: application/backend
+        run: |
+          echo "Java version:"
+          java -version
+
+      - name: Display Maven version
+        working-directory: application/backend
+        run: |
+          echo "Maven version:"
+          ./mvnw --version
+
+      - name: Compile
+        working-directory: application/backend
+        run: |
+          echo "========================================"
+          echo "Compiling application"
+          echo "========================================"
+          ./mvnw --batch-mode compile
+
+      - name: Run unit tests
+        working-directory: application/backend
+        run: |
+          echo "========================================"
+          echo "Running unit tests"
+          echo "========================================"
+          ./mvnw --batch-mode test
+
+      - name: Run integration tests
+        working-directory: application/backend
+        run: |
+          echo "========================================"
+          echo "Running integration tests with Maven Failsafe"
+          echo "========================================"
+          ./mvnw --batch-mode failsafe:integration-test failsafe:verify
+
+      - name: Dependency security scan
+        id: dependency_scan
+        working-directory: application/backend
+        continue-on-error: true
+        run: |
+          echo "========================================"
+          echo "Scanning dependencies for vulnerabilities"
+          echo "========================================"
+          # OWASP Dependency-Check command
+          # Dependency-Check returns a failure when a vulnerability with CVSS >= 7.0 is found.
+          # continue-on-error currently makes this a non-blocking security check.
+          ./mvnw --batch-mode org.owasp:dependency-check-maven:12.2.2:check \
+            -DnvdApiKeyEnvironmentVariable=NVD_API_KEY \
+            -DfailBuildOnCVSS=7
+        env:
+          NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
+
+      - name: Report dependency scan result
+        if: ${{ always() }}
+        run: |
+          echo "========================================"
+          echo "Dependency security scan result"
+          echo "========================================"
+          echo "Outcome: ${{ steps.dependency_scan.outcome }}"
+          echo "Conclusion: ${{ steps.dependency_scan.conclusion }}"
+          if [ "${{ steps.dependency_scan.outcome }}" = "failure" ]; then
+            echo "Vulnerabilities meeting the configured CVSS threshold were detected."
+            echo "The pipeline continues because this scan is currently non-blocking."
+          else
+            echo "No blocking vulnerabilities were detected."
+          fi  
+          
+      - name: Upload dependency security report
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-check-report
+          path: application/backend/target/dependency-check-report.html
+          if-no-files-found: warn
+
+      - name: SonarQube analysis
+        working-directory: application/backend
+        run: |
+          ./mvnw --batch-mode org.sonarsource.scanner.maven:sonar-maven-plugin:5.5.0.6356:sonar \
+            -Dsonar.organization="${{ vars.SONAR_ORGANIZATION }}" \
+            -Dsonar.projectKey="${{ vars.SONAR_PROJECT_KEY }}" \
+            -Dsonar.qualitygate.wait=true
+        env:
+          SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+       
+      - name: Generate SonarQube report
+        working-directory: application/backend
+        run: |
+          curl --fail \
+            -H "Authorization: Bearer ${SONAR_TOKEN}" \
+            "https://sonarcloud.io/api/qualitygates/project_status?projectKey=${{ vars.SONAR_PROJECT_KEY }}" \
+            -o sonarqube-report.json
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+      - name: Upload SonarQube report
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: sonarqube-report
+          path: application/backend/sonarqube-report.json
+
+      - name: Package application
+        working-directory: application/backend
+        run: |
+          echo "========================================"
+          echo "Packaging application"
+          echo "========================================"
+          ./mvnw --batch-mode package -DskipTests
+          
+      - name: Build container image
+        working-directory: application/backend
+        run: |
+          echo "========================================"
+          echo "Building container image"
+          echo "========================================"
+          docker build -t full-stack-observability:${{ github.sha }} .
+
+      - name: Set up Trivy
+        uses: aquasecurity/setup-trivy@e07451d2e059ed86c2870430ea286b3a9e0bf241
+
+      - name: Scan container image
+        id: container_scan
+        continue-on-error: true
+        run: |
+          echo "========================================"
+          echo "Scanning container image for vulnerabilities"
+          echo "========================================"
+          trivy image \
+            --format template \
+            --template "@$HOME/.local/bin/trivy-bin/contrib/html.tpl" \
+            --output trivy-report.html \
+            full-stack-observability:${{ github.sha }}
+
+      - name: Upload container security report
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-container-scan-report
+          path: trivy-report.html
+          if-no-files-found: warn
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ vars.REGISTRY }}
+          username: ${{ vars.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Tag container image
+        run: |
+          echo "========================================"
+          echo "Tagging container image"
+          echo "========================================"
+          docker tag \
+            full-stack-observability:${{ github.sha }} \
+            ${{ vars.REGISTRY }}/${{ vars.DOCKER_IMAGE }}:${{ github.sha }}
+
+      - name: Push container image
+        run: |
+          echo "========================================"
+          echo "Publishing container image"
+          echo "========================================"
+
+          docker push \
+            ${{ vars.REGISTRY }}/${{ vars.DOCKER_IMAGE }}:${{ github.sha }}
+
+      - name: Set up Kubernetes cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: delivery-platform
+          
+      - name: Verify Kubernetes cluster
+        run: |
+          echo "========================================"
+          echo "Verifying Kubernetes cluster"
+          echo "========================================"
+          kubectl cluster-info
+          kubectl get nodes
+
+      - name: Validate Helm chart
+        run: |
+          echo "========================================"
+          echo "Validating Helm chart"
+          echo "========================================"
+
+          helm lint ./helm/full-stack-observability
+
+          helm template full-stack-observability \
+            ./helm/full-stack-observability \
+            --namespace full-stack-observability \
+            --set image.repository="${{ vars.REGISTRY }}/${{ vars.DOCKER_IMAGE }}" \
+            --set image.tag="${{ github.sha }}" \
+            --set image.pullPolicy=Always
+
+      - name: Deploy application with Helm
+        run: |
+          echo "============================================="
+          echo "Deploying application to Kubernetes with Helm"
+          echo "============================================="
+
+          helm upgrade --install full-stack-observability \
+            ./helm/full-stack-observability \
+            --namespace full-stack-observability \
+            --create-namespace \
+            --set image.repository="${{ vars.REGISTRY }}/${{ vars.DOCKER_IMAGE }}" \
+            --set image.tag="${{ github.sha }}" \
+            --set image.pullPolicy=Always \
+            --wait --timeout 180s
+            
+      - name: Display Kubernetes resources
+        if: ${{ always() }}
+        run: |
+          echo "========================================"
+          echo "Kubernetes resources"
+          echo "========================================"
+
+          kubectl get all --namespace=full-stack-observability
+
+          echo ""
+          echo "========================================"
+          echo "Pod details"
+          echo "========================================"
+
+          kubectl describe pods --namespace=full-stack-observability
+
+      - name: Run deployment smoke test
+        run: |
+          echo "========================================"
+          echo "Running deployment smoke test"
+          echo "========================================"
+
+          kubectl wait --for=condition=ready pod \
+            -l app.kubernetes.io/name=full-stack-observability,app.kubernetes.io/instance=full-stack-observability \
+            --namespace=full-stack-observability --timeout=180s
+
+          kubectl get pods --namespace=full-stack-observability
+
+          kubectl port-forward service/full-stack-observability \
+            8080:8080 --namespace=full-stack-observability &
+          
+          echo "Checking application readiness..."
+
+          ready=false
+          for i in {1..20}; do
+            if curl --fail --silent --show-error \
+                http://localhost:8080/q/health/ready; then
+              echo ""
+              echo "Application is ready."
+              ready=true
+              break
+            fi
+
+            echo "Application not ready yet. Retrying..."
+            sleep 4
+          done
+          if [ "$ready" != "true" ]; then
+            echo "Application failed to become ready after 20 attempts."
+            exit 1
+          fi
+
+          echo ""
+          echo "Testing reverse endpoint..."
+
+          response=$(curl --fail --silent --show-error \
+            -X POST http://localhost:8080/utils/reverse \
+            -H 'accept: application/json' \
+            -H 'Content-Type: application/json' \
+            -d '{"input":"string"}')
+
+          echo "Response: $response"
+          output=$(echo "$response" | jq -r '.output')
+
+          if [ "$output" != "gnirts" ]; then
+            echo "Smoke test failed: unexpected response"
+            echo "Expected output: gnirts"
+            echo "Received output: $output"
+            exit 1
+          fi
+          echo "Reverse endpoint smoke test passed."

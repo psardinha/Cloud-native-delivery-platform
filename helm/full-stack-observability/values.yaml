@@ -1,0 +1,18 @@
+image:
+  repository: ""
+  tag: latest
+  pullPolicy: IfNotPresent
+
+replicaCount: 1
+
+service:
+  type: ClusterIP
+  port: 8080
+  targetPort: 8080
+
+otel:
+  exporterOtlpEndpoint: "http://lgtm-collector:4317"
+  proxyCollectorUrl: "http://lgtm-collector:4318"
+
+cors:
+  origins: "http://localhost:4200,http://localhost:4201"  

@@ -1,0 +1,12 @@
+{{- if .Values.service -}}
+The {{ include "full-stack-observability.fullname" . }} application has been deployed.
+
+Service:
+  {{ include "full-stack-observability.fullname" . }}
+
+Namespace:
+  {{ .Release.Namespace }}
+
+Port:
+  {{ .Values.service.port }}
+{{- end }}
